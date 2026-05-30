@@ -123,14 +123,14 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     if not args:
         await update.message.reply_text(
-            "Usage: `/scrape https://ibb.co/user/username`",
+            "Usage: `/scrape https://username.imgbb.com/`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     profile_url = args[0].strip()
-    if "ibb.co" not in profile_url:
-        await update.message.reply_text("❌ Please provide a valid ibb.co profile URL.")
+    if "ibb.co" not in profile_url and "imgbb.com" not in profile_url:
+        await update.message.reply_text("❌ Please provide a valid imgbb.com or ibb.co profile URL.")
         return
 
     # Acknowledge and kick off scraping in the background
