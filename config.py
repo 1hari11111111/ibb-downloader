@@ -3,7 +3,7 @@
 # ============================================================
 
 # Your Telegram bot token from @BotFather
-BOT_TOKEN = "8538662070:AAE19w27EEfGrQSU2fs1z6KSG82fb83mhdQ"
+BOT_TOKEN = ""
 
 # Telegram user IDs allowed to use the bot (admin only)
 ADMIN_IDS = [8745603483]
