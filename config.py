@@ -1,24 +1,24 @@
 # ============================================================
 #  IBB Downloader Bot — Configuration
-#  Fill in all values before running the bot
 # ============================================================
 
 # Your Telegram bot token from @BotFather
 BOT_TOKEN = "8538662070:AAE19w27EEfGrQSU2fs1z6KSG82fb83mhdQ"
 
 # Telegram user IDs allowed to use the bot (admin only)
-# Example: ADMIN_IDS = [123456789, 987654321]
 ADMIN_IDS = [8745603483]
 
 # The channel/group ID where media will be forwarded
-# For a channel: use negative ID like -1001234567890
-# To get ID: forward a message from your channel to @userinfobot
 DB_CHANNEL_ID = -1003940503301
 
-# Delay in seconds between each file download (be polite to IBB servers)
+# imgbb login credentials (needed for private profiles)
+IMGBB_EMAIL    = "nenuevaru813@gmail.com"
+IMGBB_PASSWORD = "qLX$J@s3yNzdF6_"
+
+# Delay in seconds between each file download
 RATE_LIMIT_DELAY = 2.0
 
-# Delay in seconds between fetching each image page on IBB
+# Delay in seconds between fetching each image page
 PAGE_FETCH_DELAY = 1.5
 
 # Temporary folder to store files before sending
