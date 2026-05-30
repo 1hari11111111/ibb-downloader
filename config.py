@@ -8,12 +8,12 @@ BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 
 # Telegram user IDs allowed to use the bot (admin only)
 # Example: ADMIN_IDS = [123456789, 987654321]
-ADMIN_IDS = [YOUR_TELEGRAM_USER_ID]
+ADMIN_IDS = [8745603483]
 
 # The channel/group ID where media will be forwarded
 # For a channel: use negative ID like -1001234567890
 # To get ID: forward a message from your channel to @userinfobot
-DB_CHANNEL_ID = YOUR_DB_CHANNEL_ID
+DB_CHANNEL_ID = -1003940503301
 
 # Delay in seconds between each file download (be polite to IBB servers)
 RATE_LIMIT_DELAY = 2.0
