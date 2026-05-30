@@ -1,70 +1,34 @@
 """
-scraper.py — Scrapes an imgbb.com user profile and returns all media URLs.
+scraper.py — Scrapes an imgbb.com user profile with login support.
 
-Supports both formats:
+Logs in with email+password, then scrapes all media using the JSON API.
+Supports both:
   - https://username.imgbb.com/
   - https://ibb.co/user/username
-
-Flow:
-  1. Detect URL format and extract username
-  2. Hit imgbb's JSON API endpoint to get all images (handles pagination)
-  3. Return a list of MediaItem objects with direct download URLs
 """
 
 import re
 import time
 import logging
 from dataclasses import dataclass
-from typing import Generator
 
 import requests
 from bs4 import BeautifulSoup
 
-from config import HEADERS, PAGE_FETCH_DELAY, REQUEST_TIMEOUT, MAX_RETRIES
+from config import HEADERS, PAGE_FETCH_DELAY, REQUEST_TIMEOUT, MAX_RETRIES, IMGBB_EMAIL, IMGBB_PASSWORD
 
 logger = logging.getLogger(__name__)
+
+LOGIN_URL = "https://imgbb.com/login"
+HOME_URL  = "https://imgbb.com/"
 
 
 @dataclass
 class MediaItem:
-    page_url: str       # e.g. https://ibb.co/AbCdEfG
-    direct_url: str     # actual file URL (i.ibb.co/...)
-    filename: str       # derived filename
-    media_type: str     # "photo", "gif", "video", "document"
-
-
-def _get(url: str, retries: int = MAX_RETRIES, **kwargs) -> requests.Response | None:
-    """GET with retries."""
-    for attempt in range(1, retries + 1):
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, **kwargs)
-            resp.raise_for_status()
-            return resp
-        except requests.RequestException as e:
-            logger.warning("Attempt %d/%d failed for %s — %s", attempt, retries, url, e)
-            if attempt < retries:
-                time.sleep(PAGE_FETCH_DELAY * attempt)
-    logger.error("All retries exhausted for %s", url)
-    return None
-
-
-def _extract_username(profile_url: str) -> str:
-    """
-    Extract username from either:
-      https://username.imgbb.com/
-      https://ibb.co/user/username
-    """
-    # subdomain format: username.imgbb.com
-    match = re.search(r"https?://([^.]+)\.imgbb\.com", profile_url)
-    if match:
-        return match.group(1)
-
-    # ibb.co/user/username format
-    match = re.search(r"ibb\.co/user/([^/?#]+)", profile_url)
-    if match:
-        return match.group(1)
-
-    raise ValueError(f"Could not parse username from URL: {profile_url}")
+    page_url: str
+    direct_url: str
+    filename: str
+    media_type: str
 
 
 def _media_type_from_ext(filename: str) -> str:
@@ -78,38 +42,84 @@ def _media_type_from_ext(filename: str) -> str:
     return "document"
 
 
-def _fetch_via_api(username: str) -> list[MediaItem]:
-    """
-    imgbb exposes a paginated JSON endpoint:
-      https://<username>.imgbb.com/json?page=1&seek=<last_id>
+def _extract_username(profile_url: str) -> str:
+    match = re.search(r"https?://([^.]+)\.imgbb\.com", profile_url)
+    if match:
+        return match.group(1)
+    match = re.search(r"ibb\.co/user/([^/?#]+)", profile_url)
+    if match:
+        return match.group(1)
+    raise ValueError(f"Could not parse username from URL: {profile_url}")
 
-    Each response contains an array of image objects with:
-      - image.url      → direct image URL (i.ibb.co/...)
-      - image.url_viewer → page URL
-      - image.filename
-      - image.thumb.url → thumbnail
-      - video.url      → if it's a video
+
+def _create_session() -> requests.Session:
+    """Create a session and log in to imgbb."""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    if not IMGBB_EMAIL or not IMGBB_PASSWORD:
+        logger.info("No imgbb credentials set — trying without login.")
+        return session
+
+    # Step 1: GET login page to grab the auth_token
+    logger.info("Logging in to imgbb as %s...", IMGBB_EMAIL)
+    resp = session.get(LOGIN_URL, timeout=REQUEST_TIMEOUT)
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    auth_token = ""
+    token_input = soup.find("input", {"name": "auth_token"})
+    if token_input:
+        auth_token = token_input.get("value", "")
+
+    # Step 2: POST login credentials
+    payload = {
+        "auth_token": auth_token,
+        "login-subject": IMGBB_EMAIL,
+        "password": IMGBB_PASSWORD,
+        "action": "login",
+    }
+    login_resp = session.post(
+        LOGIN_URL,
+        data=payload,
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=True,
+    )
+
+    # Check if login succeeded
+    if "logout" in login_resp.text.lower() or "sign out" in login_resp.text.lower():
+        logger.info("Login successful!")
+    elif login_resp.url and "imgbb.com" in login_resp.url and "login" not in login_resp.url:
+        logger.info("Login successful (redirected to home)!")
+    else:
+        logger.warning("Login may have failed — check credentials in config.")
+
+    return session
+
+
+def _fetch_all_media(session: requests.Session, username: str) -> list[MediaItem]:
     """
-    base_url = f"https://{username}.imgbb.com/json"
+    Use imgbb's JSON endpoint to get all images for a user profile.
+    Falls back to HTML parsing if JSON API fails.
+    """
     items: list[MediaItem] = []
     page = 1
     seek = None
+
+    base_url = f"https://{username}.imgbb.com/json"
 
     while True:
         params = {"page": page, "per_page": 100}
         if seek:
             params["seek"] = seek
 
-        logger.info("Fetching API page %d for user %s", page, username)
-        resp = _get(base_url, params=params)
-        if resp is None:
-            logger.warning("API request failed at page %d", page)
-            break
+        logger.info("Fetching page %d for user %s", page, username)
 
         try:
+            resp = session.get(base_url, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.error("Failed to parse JSON response: %s", e)
+            logger.warning("JSON API failed at page %d: %s", page, e)
             break
 
         images = data.get("images") or data.get("data") or []
@@ -118,24 +128,24 @@ def _fetch_via_api(username: str) -> list[MediaItem]:
             break
 
         for img in images:
-            # Try video first
             video = img.get("video") or {}
             image = img.get("image") or {}
-            thumb = img.get("thumb") or {}
 
             if video.get("url"):
                 direct_url = video["url"]
             elif image.get("url"):
                 direct_url = image["url"]
             else:
-                # fallback: construct from image id
-                img_id = img.get("id_encoded") or img.get("id") or ""
-                direct_url = img.get("url_viewer", "")
+                direct_url = img.get("display_url") or img.get("url_viewer", "")
                 if not direct_url:
                     continue
 
-            filename = image.get("filename") or direct_url.split("/")[-1].split("?")[0]
-            page_url = img.get("url_viewer") or img.get("display_url") or direct_url
+            filename = (
+                image.get("filename")
+                or direct_url.split("/")[-1].split("?")[0]
+                or "file.jpg"
+            )
+            page_url = img.get("url_viewer") or direct_url
 
             items.append(MediaItem(
                 page_url=page_url,
@@ -144,17 +154,14 @@ def _fetch_via_api(username: str) -> list[MediaItem]:
                 media_type=_media_type_from_ext(filename),
             ))
 
-        logger.info("Page %d — got %d items (total so far: %d)", page, len(images), len(items))
+        logger.info("Page %d — %d items (total: %d)", page, len(images), len(items))
 
-        # Pagination: check if there are more pages
-        has_more = (
-            data.get("current_page") != data.get("total_pages")
-            and len(images) >= 10
-        )
-        if not has_more:
+        # Check pagination
+        total_pages = data.get("total_pages") or data.get("pages_count") or 1
+        current_page = data.get("current_page") or page
+        if int(current_page) >= int(total_pages) or len(images) < 10:
             break
 
-        # Use last image id as seek cursor if available
         if images:
             last = images[-1]
             seek = last.get("id_encoded") or last.get("id") or None
@@ -162,53 +169,59 @@ def _fetch_via_api(username: str) -> list[MediaItem]:
         page += 1
         time.sleep(PAGE_FETCH_DELAY)
 
+    # If JSON API returned nothing, try HTML fallback
+    if not items:
+        logger.info("JSON API returned nothing — trying HTML fallback...")
+        items = _fetch_via_html(session, username)
+
     return items
 
 
-def _fetch_via_html(username: str) -> list[MediaItem]:
-    """
-    Fallback: parse the HTML profile page if JSON API fails.
-    Looks for og:image and data-src attributes.
-    """
+def _fetch_via_html(session: requests.Session, username: str) -> list[MediaItem]:
+    """HTML fallback scraper."""
     items: list[MediaItem] = []
     page = 1
     seen: set[str] = set()
 
     while True:
         url = f"https://{username}.imgbb.com/?page={page}"
-        logger.info("HTML fallback — fetching page %d", page)
-        resp = _get(url)
-        if resp is None:
+        try:
+            resp = session.get(url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+        except Exception as e:
+            logger.warning("HTML fetch failed at page %d: %s", page, e)
             break
 
         soup = BeautifulSoup(resp.text, "html.parser")
         found = 0
 
-        # Each image card typically has a link to the viewer page
-        for a in soup.select("a.image-container, .list-item-image a, a[href*='ibb.co']"):
+        for a in soup.select("a.image-container, .list-item-image a"):
             href = a.get("href", "").strip()
             if not href or href in seen:
                 continue
             seen.add(href)
 
-            # Get direct url from data attribute if available
+            # Try to get direct URL from data attributes first
+            img_tag = a.find("img")
             direct = (
                 a.get("data-url") or
                 a.get("data-src") or
-                (a.find("img") or {}).get("src", "") if a.find("img") else ""
+                (img_tag.get("src", "") if img_tag else "")
             )
 
-            if not direct:
-                # visit viewer page to get direct URL
+            # If still no direct URL, visit viewer page
+            if not direct or "thumb" in direct:
                 time.sleep(PAGE_FETCH_DELAY)
-                vresp = _get(href)
-                if vresp:
+                try:
+                    vresp = session.get(href, timeout=REQUEST_TIMEOUT)
                     vsoup = BeautifulSoup(vresp.text, "html.parser")
                     og = vsoup.find("meta", property="og:image")
                     direct = og["content"] if og else ""
                     if not direct:
                         dl = vsoup.select_one("a.btn-download, a[href*='i.ibb.co']")
                         direct = dl["href"] if dl else ""
+                except Exception:
+                    continue
 
             if not direct:
                 continue
@@ -228,7 +241,9 @@ def _fetch_via_html(username: str) -> list[MediaItem]:
 
         logger.info("HTML page %d — found %d items", page, found)
 
-        next_btn = soup.select_one("a[data-pagination='next'], .pagination .next a, a[rel='next']")
+        next_btn = soup.select_one(
+            "a[data-pagination='next'], .pagination .next a, a[rel='next']"
+        )
         if not next_btn or found == 0:
             break
 
@@ -241,18 +256,13 @@ def _fetch_via_html(username: str) -> list[MediaItem]:
 def scrape_profile(profile_url: str) -> tuple[list[MediaItem], str]:
     """
     Main entry point.
-    Returns (list_of_MediaItems, username).
-    Tries JSON API first, falls back to HTML scraping.
+    Logs in, scrapes all media, returns (items, username).
     """
     username = _extract_username(profile_url)
-    logger.info("Starting scrape for imgbb user: %s", username)
+    logger.info("Scraping imgbb profile: %s", username)
 
-    # Try JSON API first (faster, more reliable)
-    items = _fetch_via_api(username)
+    session = _create_session()
+    items = _fetch_all_media(session, username)
 
-    if not items:
-        logger.info("JSON API returned nothing, trying HTML fallback...")
-        items = _fetch_via_html(username)
-
-    logger.info("Total media items found for %s: %d", username, len(items))
+    logger.info("Total found for %s: %d", username, len(items))
     return items, username
