@@ -1,11 +1,14 @@
 """
-scraper.py — Scrapes an IBB user profile and returns all media URLs.
+scraper.py — Scrapes an imgbb.com user profile and returns all media URLs.
+
+Supports both formats:
+  - https://username.imgbb.com/
+  - https://ibb.co/user/username
 
 Flow:
-  1. Fetch the profile page(s) at ibb.co/user/<username>
-  2. Collect every individual image-page link (e.g. ibb.co/AbCdEfG)
-  3. Visit each image page and extract the direct media URL
-  4. Return a list of MediaItem objects
+  1. Detect URL format and extract username
+  2. Hit imgbb's JSON API endpoint to get all images (handles pagination)
+  3. Return a list of MediaItem objects with direct download URLs
 """
 
 import re
@@ -21,22 +24,20 @@ from config import HEADERS, PAGE_FETCH_DELAY, REQUEST_TIMEOUT, MAX_RETRIES
 
 logger = logging.getLogger(__name__)
 
-IBB_BASE = "https://ibb.co"
-
 
 @dataclass
 class MediaItem:
     page_url: str       # e.g. https://ibb.co/AbCdEfG
-    direct_url: str     # actual file URL
+    direct_url: str     # actual file URL (i.ibb.co/...)
     filename: str       # derived filename
     media_type: str     # "photo", "gif", "video", "document"
 
 
-def _get(url: str, retries: int = MAX_RETRIES) -> requests.Response | None:
-    """GET with retries and a small delay."""
+def _get(url: str, retries: int = MAX_RETRIES, **kwargs) -> requests.Response | None:
+    """GET with retries."""
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, **kwargs)
             resp.raise_for_status()
             return resp
         except requests.RequestException as e:
@@ -48,158 +49,210 @@ def _get(url: str, retries: int = MAX_RETRIES) -> requests.Response | None:
 
 
 def _extract_username(profile_url: str) -> str:
-    """Pull the username out of a profile URL."""
+    """
+    Extract username from either:
+      https://username.imgbb.com/
+      https://ibb.co/user/username
+    """
+    # subdomain format: username.imgbb.com
+    match = re.search(r"https?://([^.]+)\.imgbb\.com", profile_url)
+    if match:
+        return match.group(1)
+
+    # ibb.co/user/username format
     match = re.search(r"ibb\.co/user/([^/?#]+)", profile_url)
-    if not match:
-        raise ValueError(f"Could not parse username from URL: {profile_url}")
-    return match.group(1)
+    if match:
+        return match.group(1)
+
+    raise ValueError(f"Could not parse username from URL: {profile_url}")
 
 
-def _image_page_links(profile_url: str) -> Generator[str, None, None]:
+def _media_type_from_ext(filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext in ("mp4", "webm", "mov", "avi"):
+        return "video"
+    elif ext == "gif":
+        return "gif"
+    elif ext in ("jpg", "jpeg", "png", "webp", "bmp"):
+        return "photo"
+    return "document"
+
+
+def _fetch_via_api(username: str) -> list[MediaItem]:
     """
-    Yield every individual image-page URL from a profile,
-    following IBB's pagination automatically.
-    """
-    # Normalise to the /uploads tab which lists all user-uploaded media
-    username = _extract_username(profile_url)
-    base = f"{IBB_BASE}/user/{username}/uploads"
+    imgbb exposes a paginated JSON endpoint:
+      https://<username>.imgbb.com/json?page=1&seek=<last_id>
 
+    Each response contains an array of image objects with:
+      - image.url      → direct image URL (i.ibb.co/...)
+      - image.url_viewer → page URL
+      - image.filename
+      - image.thumb.url → thumbnail
+      - video.url      → if it's a video
+    """
+    base_url = f"https://{username}.imgbb.com/json"
+    items: list[MediaItem] = []
+    page = 1
+    seek = None
+
+    while True:
+        params = {"page": page, "per_page": 100}
+        if seek:
+            params["seek"] = seek
+
+        logger.info("Fetching API page %d for user %s", page, username)
+        resp = _get(base_url, params=params)
+        if resp is None:
+            logger.warning("API request failed at page %d", page)
+            break
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            logger.error("Failed to parse JSON response: %s", e)
+            break
+
+        images = data.get("images") or data.get("data") or []
+        if not images:
+            logger.info("No more images at page %d", page)
+            break
+
+        for img in images:
+            # Try video first
+            video = img.get("video") or {}
+            image = img.get("image") or {}
+            thumb = img.get("thumb") or {}
+
+            if video.get("url"):
+                direct_url = video["url"]
+            elif image.get("url"):
+                direct_url = image["url"]
+            else:
+                # fallback: construct from image id
+                img_id = img.get("id_encoded") or img.get("id") or ""
+                direct_url = img.get("url_viewer", "")
+                if not direct_url:
+                    continue
+
+            filename = image.get("filename") or direct_url.split("/")[-1].split("?")[0]
+            page_url = img.get("url_viewer") or img.get("display_url") or direct_url
+
+            items.append(MediaItem(
+                page_url=page_url,
+                direct_url=direct_url,
+                filename=filename,
+                media_type=_media_type_from_ext(filename),
+            ))
+
+        logger.info("Page %d — got %d items (total so far: %d)", page, len(images), len(items))
+
+        # Pagination: check if there are more pages
+        has_more = (
+            data.get("current_page") != data.get("total_pages")
+            and len(images) >= 10
+        )
+        if not has_more:
+            break
+
+        # Use last image id as seek cursor if available
+        if images:
+            last = images[-1]
+            seek = last.get("id_encoded") or last.get("id") or None
+
+        page += 1
+        time.sleep(PAGE_FETCH_DELAY)
+
+    return items
+
+
+def _fetch_via_html(username: str) -> list[MediaItem]:
+    """
+    Fallback: parse the HTML profile page if JSON API fails.
+    Looks for og:image and data-src attributes.
+    """
+    items: list[MediaItem] = []
     page = 1
     seen: set[str] = set()
 
     while True:
-        url = f"{base}?page={page}"
-        logger.info("Fetching profile page %d — %s", page, url)
+        url = f"https://{username}.imgbb.com/?page={page}"
+        logger.info("HTML fallback — fetching page %d", page)
         resp = _get(url)
         if resp is None:
             break
 
         soup = BeautifulSoup(resp.text, "html.parser")
+        found = 0
 
-        # IBB wraps each thumbnail in an <a> inside .list-item-image
-        links_found = 0
-        for a_tag in soup.select("a.image-container"):
-            href = a_tag.get("href", "")
-            if not href:
+        # Each image card typically has a link to the viewer page
+        for a in soup.select("a.image-container, .list-item-image a, a[href*='ibb.co']"):
+            href = a.get("href", "").strip()
+            if not href or href in seen:
                 continue
-            full = href if href.startswith("http") else IBB_BASE + href
-            if full not in seen:
-                seen.add(full)
-                links_found += 1
-                yield full
+            seen.add(href)
 
-        # Also try the viewer links pattern
-        for a_tag in soup.select(".list-item-image a"):
-            href = a_tag.get("href", "")
-            if not href:
+            # Get direct url from data attribute if available
+            direct = (
+                a.get("data-url") or
+                a.get("data-src") or
+                (a.find("img") or {}).get("src", "") if a.find("img") else ""
+            )
+
+            if not direct:
+                # visit viewer page to get direct URL
+                time.sleep(PAGE_FETCH_DELAY)
+                vresp = _get(href)
+                if vresp:
+                    vsoup = BeautifulSoup(vresp.text, "html.parser")
+                    og = vsoup.find("meta", property="og:image")
+                    direct = og["content"] if og else ""
+                    if not direct:
+                        dl = vsoup.select_one("a.btn-download, a[href*='i.ibb.co']")
+                        direct = dl["href"] if dl else ""
+
+            if not direct:
                 continue
-            full = href if href.startswith("http") else IBB_BASE + href
-            if full not in seen and "ibb.co" in full:
-                seen.add(full)
-                links_found += 1
-                yield full
 
-        logger.info("Page %d — found %d new links", page, links_found)
+            direct = direct.strip()
+            if direct.startswith("//"):
+                direct = "https:" + direct
 
-        # Check if there's a next page
-        next_btn = soup.select_one("a[data-pagination='next']") or \
-                   soup.select_one(".pagination .next a") or \
-                   soup.select_one("a[rel='next']")
-        if not next_btn or links_found == 0:
+            filename = direct.split("?")[0].split("/")[-1] or "file.jpg"
+            items.append(MediaItem(
+                page_url=href,
+                direct_url=direct,
+                filename=filename,
+                media_type=_media_type_from_ext(filename),
+            ))
+            found += 1
+
+        logger.info("HTML page %d — found %d items", page, found)
+
+        next_btn = soup.select_one("a[data-pagination='next'], .pagination .next a, a[rel='next']")
+        if not next_btn or found == 0:
             break
 
         page += 1
         time.sleep(PAGE_FETCH_DELAY)
 
-
-def _extract_direct_url(image_page_url: str) -> MediaItem | None:
-    """
-    Visit a single IBB image page and extract the direct media URL.
-    IBB puts the full-size URL in:
-      - og:image meta tag
-      - the download link
-      - the viewer image src
-    """
-    resp = _get(image_page_url)
-    if resp is None:
-        return None
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    direct_url = None
-
-    # 1. Try the download button link (most reliable)
-    dl = soup.select_one("a.btn-download") or \
-         soup.select_one("a[href*='i.ibb.co']")
-    if dl:
-        direct_url = dl.get("href", "")
-
-    # 2. Fall back to og:image
-    if not direct_url:
-        og = soup.find("meta", property="og:image")
-        if og:
-            direct_url = og.get("content", "")
-
-    # 3. Fall back to the main viewer image
-    if not direct_url:
-        img = soup.select_one("#image-viewer-container img") or \
-              soup.select_one(".viewer-image img") or \
-              soup.select_one("img#image-id")
-        if img:
-            direct_url = img.get("src", "")
-
-    if not direct_url:
-        logger.warning("Could not find direct URL on page: %s", image_page_url)
-        return None
-
-    # Clean up URL
-    direct_url = direct_url.strip()
-    if direct_url.startswith("//"):
-        direct_url = "https:" + direct_url
-
-    # Derive filename
-    filename = direct_url.split("?")[0].split("/")[-1]
-    if not filename:
-        filename = image_page_url.split("/")[-1] + ".jpg"
-
-    # Determine media type
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext in ("mp4", "webm", "mov", "avi"):
-        media_type = "video"
-    elif ext == "gif":
-        media_type = "gif"
-    elif ext in ("jpg", "jpeg", "png", "webp", "bmp"):
-        media_type = "photo"
-    else:
-        media_type = "document"
-
-    return MediaItem(
-        page_url=image_page_url,
-        direct_url=direct_url,
-        filename=filename,
-        media_type=media_type,
-    )
+    return items
 
 
 def scrape_profile(profile_url: str) -> tuple[list[MediaItem], str]:
     """
     Main entry point.
     Returns (list_of_MediaItems, username).
-    Collects all image page links first, then resolves each to a direct URL.
+    Tries JSON API first, falls back to HTML scraping.
     """
     username = _extract_username(profile_url)
-    logger.info("Starting scrape for user: %s", username)
+    logger.info("Starting scrape for imgbb user: %s", username)
 
-    page_links = list(_image_page_links(profile_url))
-    logger.info("Found %d image pages for user %s", len(page_links), username)
+    # Try JSON API first (faster, more reliable)
+    items = _fetch_via_api(username)
 
-    items: list[MediaItem] = []
-    for i, link in enumerate(page_links, 1):
-        logger.info("Resolving %d/%d — %s", i, len(page_links), link)
-        item = _extract_direct_url(link)
-        if item:
-            items.append(item)
-        time.sleep(PAGE_FETCH_DELAY)
+    if not items:
+        logger.info("JSON API returned nothing, trying HTML fallback...")
+        items = _fetch_via_html(username)
 
-    logger.info("Resolved %d media items for user %s", len(items), username)
+    logger.info("Total media items found for %s: %d", username, len(items))
     return items, username
