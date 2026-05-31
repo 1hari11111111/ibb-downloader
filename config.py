@@ -9,7 +9,7 @@ BOT_TOKEN = ""
 ADMIN_IDS = [8745603483]
 
 # The channel/group ID where media will be forwarded
-DB_CHANNEL_ID = -1003940503301
+DB_CHANNEL_ID = -1003862938674
 
 # imgbb login credentials (needed for private profiles)
 IMGBB_EMAIL    = "nenuevaru813@gmail.com"
