@@ -10,10 +10,21 @@ CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, profile_url TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, source_key TEXT NOT NULL, page_url TEXT NOT NULL, direct_url TEXT NOT NULL, filename TEXT NOT NULL, media_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at REAL NOT NULL DEFAULT 0, lease_until REAL, local_path TEXT, telegram_message_id INTEGER, last_error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL, sent_at REAL, UNIQUE(job_id, source_key));
 CREATE INDEX IF NOT EXISTS idx_items_ready ON items(job_id,status,next_attempt_at);
 CREATE TABLE IF NOT EXISTS stats(id INTEGER PRIMARY KEY CHECK(id=1), total_sent INTEGER NOT NULL DEFAULT 0, total_skipped INTEGER NOT NULL DEFAULT 0, total_failed INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS settings(name TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO stats(id) VALUES(1);
 """
 
 def key(url: str) -> str: return hashlib.sha256(url.encode()).hexdigest()
+
+def set_setting(name: str, value: str) -> None:
+    with connect() as c:
+        c.execute("INSERT INTO settings(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value", (name, str(value)))
+
+def get_setting(name: str, default=None):
+    with connect() as c:
+        row = c.execute("SELECT value FROM settings WHERE name=?", (name,)).fetchone()
+    return row[0] if row else default
+
 @contextmanager
 def connect():
     conn = sqlite3.connect(DB_FILE, timeout=30, isolation_level=None)

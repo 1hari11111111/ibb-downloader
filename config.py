@@ -56,7 +56,7 @@ class Settings:
         admins = _ids("ADMIN_IDS")
         channel = os.getenv("DB_CHANNEL_ID", "").strip()
         if require_runtime:
-            missing = [k for k, v in (("BOT_TOKEN", token), ("ADMIN_IDS", admins), ("DB_CHANNEL_ID", channel)) if not v]
+            missing = [k for k, v in (("BOT_TOKEN", token), ("ADMIN_IDS", admins)) if not v]
             if missing: raise ValueError("Missing required environment variables: " + ", ".join(missing))
         root = Path(os.getenv("APP_DATA_DIR", ".")).expanduser().resolve()
         return cls(token, admins, int(channel or 0), os.getenv("IMGBB_EMAIL", ""), os.getenv("IMGBB_PASSWORD", ""),
