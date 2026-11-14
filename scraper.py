@@ -204,14 +204,16 @@ def fetch_page(session, username: str, page: int, seek: str | None) -> tuple[lis
             seen.add(item.direct_url)
             items.append(item)
 
-    # ImgBB profile pages currently return a fixed-size batch (often 32
-    # records) even when ``per_page`` is larger.  Some responses expose a
-    # cursor, while others paginate only through the ``page`` parameter.  Do
-    # not manufacture a cursor from the last record: that makes the next
-    # request use an unsupported ``seek`` value and can stop after page one.
-    next_seek = data.get("seekEnd") or data.get("seek_end") or data.get("next_seek")
-    if next_seek is None:
-        next_seek = data.get("nextSeek") or data.get("next_cursor")
+    # ImgBB commonly returns exactly 32 records and exposes no explicit
+    # next-cursor field. In that response shape, the listing API expects the
+    # last record's cursor on the next request; relying on ``page`` alone can
+    # repeatedly return the first batch.
+    last = records[-1] if records else {}
+    next_seek = (
+        data.get("seekEnd") or data.get("seek_end") or data.get("next_seek")
+        or data.get("nextSeek") or data.get("next_cursor")
+        or last.get("id_encoded") or last.get("id")
+    )
     complete = not records
     return items, str(next_seek) if next_seek else None, complete
 
